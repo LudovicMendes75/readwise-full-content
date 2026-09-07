@@ -393,11 +393,18 @@ async function enrichDocument(token, doc) {
   // Preserve tags: the replacement document is created fresh and would
   // otherwise lose the user's categorization (tags set manually or by an
   // external triage pipeline). The Readwise save API accepts a "tags" field.
-  // doc.tags is not always an array (observed: string on some docs) — guard.
-  const tagNames = Array.isArray(doc.tags)
-    ? doc.tags.map((t) => (typeof t === "string" ? t : t && t.name))
-    : [];
+  // list/ returns tags as a {slug: {name, type, created}} MAP, not an array
+  // (observed 2026-09-08) — extract names from both shapes.
+  let tagNames = [];
+  if (Array.isArray(doc.tags)) {
+    tagNames = doc.tags.map((t) => (typeof t === "string" ? t : t && t.name));
+  } else if (doc.tags && typeof doc.tags === "object") {
+    tagNames = Object.keys(doc.tags);
+  }
   const filteredTags = tagNames.filter(Boolean);
+  console.log(
+    `[readwise-full-content] Preserving ${filteredTags.length} tags: ${filteredTags.join(", ") || "(none)"}`,
+  );
 
   // Replace the thin document with the full-content version
   await replaceDocument(token, doc.id, {
