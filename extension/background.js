@@ -76,6 +76,14 @@ const PAYWALL_MARKERS = [
   // all Le Monde pages and must NOT be used as a marker).
   "de cet article à lire",
 
+  // Télérama / Que Choisir (FR) — "Réservé aux abonnés" (masculine
+  // singular) appears in truncated stubs before the publication date and at
+  // the end of free content. Verified empirically: absent from fully served
+  // Télérama articles (whose generic menus say "réservée à nos inscrits" /
+  // "Avantages abonnés" — no match) and matches "Article réservé aux
+  // abonnés" on quechoisir.org.
+  "réservé aux abonnés",
+
   // Generic data-attribute markers
   "data-paywall",
   "data-regwall",
