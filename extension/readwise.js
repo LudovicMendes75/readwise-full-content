@@ -74,6 +74,14 @@ async function listDocuments(token, opts = {}) {
     allResults = allResults.concat(data.results || []);
     nextUrl = data.nextPageCursor || null;
     pages++;
+
+    // Throttle between pages: Readwise's list API cuts the connection on
+    // rapid successive requests (observed as TypeError: NetworkError in
+    // production when >100 documents changed within the 24h lookback
+    // window — the server drops the connection instead of answering 429).
+    if (nextUrl && pages < maxPages) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
   }
 
   return allResults;
