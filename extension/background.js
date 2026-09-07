@@ -373,13 +373,19 @@ async function enrichDocument(token, doc) {
   // This handles tracking redirects like click.e.economist.com → economist.com
   const canonicalUrl = finalUrl || doc.source_url;
 
-  // Check if the extracted HTML still contains paywall markers.
-  // This means the fetch didn't get past the paywall — replacing the
-  // document would just swap one paywall stub for another, and the
-  // resulting low word count would trigger re-enrichment on the next poll.
-  if (hasPaywallMarkers(html)) {
+  // Post-extraction check: only *truncation* notices block the save — wording
+  // that appears in a truncated page and disappears when the full article is
+  // served to a logged-in subscriber. Site-wide banners and footers (e.g.
+  // "Réservé aux abonnés" on lemonde.fr, promo blocks on telerama.fr) are
+  // present on fully served pages too, so PAYWALL_MARKERS must NOT be used
+  // here: they would reject every legitimate enrichment (observed in
+  // production 2026-09-08). Residual risk of saving a truncated page (expired
+  // cookies) is bounded by MIN_HTML_SIZE + the 24h cooldown.
+  const TRUNCATION_MARKERS = ["de cet article à lire"];
+  const extractedLower = html.toLowerCase();
+  if (TRUNCATION_MARKERS.some((m) => extractedLower.includes(m.toLowerCase()))) {
     console.warn(
-      `[readwise-full-content] Extracted HTML contains paywall markers, skipping — ${doc.source_url}`,
+      `[readwise-full-content] Extracted HTML still truncated, skipping — ${doc.source_url}`,
     );
     return { enriched: false, canonicalUrl };
   }
@@ -387,9 +393,11 @@ async function enrichDocument(token, doc) {
   // Preserve tags: the replacement document is created fresh and would
   // otherwise lose the user's categorization (tags set manually or by an
   // external triage pipeline). The Readwise save API accepts a "tags" field.
-  const tagNames = (doc.tags || [])
-    .map((t) => (typeof t === "string" ? t : t && t.name))
-    .filter(Boolean);
+  // doc.tags is not always an array (observed: string on some docs) — guard.
+  const tagNames = Array.isArray(doc.tags)
+    ? doc.tags.map((t) => (typeof t === "string" ? t : t && t.name))
+    : [];
+  const filteredTags = tagNames.filter(Boolean);
 
   // Replace the thin document with the full-content version
   await replaceDocument(token, doc.id, {
@@ -401,7 +409,7 @@ async function enrichDocument(token, doc) {
     summary: doc.summary,
     published_date: doc.published_date,
     image_url: doc.image_url,
-    tags: tagNames,
+    tags: filteredTags,
     location: doc.location,
     category: "article",
     saved_using: "readwise-full-content",
