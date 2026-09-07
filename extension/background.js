@@ -69,6 +69,13 @@ const PAYWALL_MARKERS = [
   "choose your subscription",
   "ft.com/products",
 
+  // Le Monde (FR) — stub truncation notice: "Il vous reste 62% de cet
+  // article à lire. La suite est réservée aux abonnés." This wording only
+  // appears on truncated (paywalled) articles, not on fully served ones
+  // (verified empirically — generic "Réservé aux abonnés" banners appear on
+  // all Le Monde pages and must NOT be used as a marker).
+  "de cet article à lire",
+
   // Generic data-attribute markers
   "data-paywall",
   "data-regwall",
