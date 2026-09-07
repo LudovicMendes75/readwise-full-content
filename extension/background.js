@@ -376,6 +376,13 @@ async function enrichDocument(token, doc) {
     return { enriched: false, canonicalUrl };
   }
 
+  // Preserve tags: the replacement document is created fresh and would
+  // otherwise lose the user's categorization (tags set manually or by an
+  // external triage pipeline). The Readwise save API accepts a "tags" field.
+  const tagNames = (doc.tags || [])
+    .map((t) => (typeof t === "string" ? t : t && t.name))
+    .filter(Boolean);
+
   // Replace the thin document with the full-content version
   await replaceDocument(token, doc.id, {
     url: canonicalUrl,
@@ -386,6 +393,7 @@ async function enrichDocument(token, doc) {
     summary: doc.summary,
     published_date: doc.published_date,
     image_url: doc.image_url,
+    tags: tagNames,
     location: doc.location,
     category: "article",
     saved_using: "readwise-full-content",
