@@ -72,13 +72,21 @@ async function listDocuments(token, opts = {}) {
 
     const data = await res.json();
     allResults = allResults.concat(data.results || []);
-    nextUrl = data.nextPageCursor || null;
+
+    // API pagination: nextPageCursor is a cursor token, NOT a URL — it must
+    // be passed back as the "pageCursor" query parameter. Fetching the raw
+    // cursor as a URL throws TypeError: NetworkError (upstream bug: every
+    // poll with >100 recently-modified documents failed on page 2).
+    if (data.nextPageCursor) {
+      params.set("pageCursor", data.nextPageCursor);
+      nextUrl = `${READWISE_BASE}/v3/list/?${params.toString()}`;
+    } else {
+      nextUrl = null;
+    }
     pages++;
 
-    // Throttle between pages: Readwise's list API cuts the connection on
-    // rapid successive requests (observed as TypeError: NetworkError in
-    // production when >100 documents changed within the 24h lookback
-    // window — the server drops the connection instead of answering 429).
+    // Throttle between pages: Readwise's list API rate-limits rapid
+    // successive requests from the same token.
     if (nextUrl && pages < maxPages) {
       await new Promise((resolve) => setTimeout(resolve, 3000));
     }
