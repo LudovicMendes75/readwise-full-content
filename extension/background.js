@@ -200,11 +200,16 @@ async function pollAndEnrich() {
 
     console.log("[readwise-full-content] Polling for thin documents...");
 
-    // Fetch documents updated recently, including HTML content
-    // so we can check for paywall markers
-    const lookbackDate = new Date(Date.now() - LOOKBACK_WINDOW).toISOString();
+    // Fetch the whole 'later' queue (the enrichment pipeline population),
+    // including HTML content so we can check for paywall markers.
+    // An updatedAfter lookback misses older stubs entirely: updated_at does
+    // NOT change on bulk tag/location updates (observed 2026-09-08 — stubs
+    // tagged by an external triage pipeline kept their original timestamp,
+    // leaving the 24h window with only brand-new saves). location=later
+    // covers the whole queue; the 24h per-URL cooldown prevents
+    // re-processing.
     const docs = await listDocuments(token, {
-      updatedAfter: lookbackDate,
+      location: "later",
       maxPages: MAX_LIST_PAGES,
       withHtmlContent: true,
     });
