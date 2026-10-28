@@ -11,16 +11,43 @@
 const POLL_INTERVAL_MINUTES = 2;
 
 /**
- * Documents with fewer words than this are always candidates for enrichment.
+ * Default number of words below which a document is always enriched.
  * This catches obvious stubs that have very little content.
+ * Raised from 200 to 500 (wp48/b07a): paywalled articles whose RSS teaser is
+ * 200-400 words were never enriched automatically and waited for a manual
+ * "Save Full Page".
+ * Overridable at runtime from the popup (storage key "lowWordCount") so a
+ * future adjustment does not require re-signing the extension.
  */
-const LOW_WORD_COUNT = 200;
+const DEFAULT_LOW_WORD_COUNT = 500;
+
+/** Bounds accepted for the popup setting (words). */
+const MIN_LOW_WORD_COUNT = 100;
+const MAX_LOW_WORD_COUNT = 1500;
+
+/**
+ * Retry schedule for a paywall that resisted extraction: the first attempt is
+ * immediate, then 1 day, 7 days and 30 days. After the 4th attempt the URL is
+ * left alone until a manual retry from the options page.
+ */
+const PAYWALL_BACKOFF_MS = [
+  24 * 60 * 60 * 1000,
+  7 * 24 * 60 * 60 * 1000,
+  30 * 24 * 60 * 60 * 1000,
+];
 
 /**
  * Documents above this word count are never enriched (assumed complete).
  * Between LOW and HIGH, we check for paywall markers in the HTML.
  */
 const HIGH_WORD_COUNT = 1500;
+
+/**
+ * Minimum gain for a re-save to be worth it: the extracted page must contain
+ * at least this ratio of the word count Readwise already reports. Below that,
+ * the re-save adds no content but still bumps updated_at (wp48/b07a).
+ */
+const MIN_GAIN_RATIO = 1.2;
 
 /**
  * Paywall / registration wall markers found in stub HTML.
@@ -175,6 +202,104 @@ async function getEnrichCount() {
   return Object.keys(urls).length;
 }
 
+/**
+ * Record of articles the extension could not enrich, with the reason. The
+ * article length never decides anything: only the extraction outcome does.
+ *  - "paywall": the page is still gated after extraction. Retried after 1 day,
+ *    7 days and 30 days, then left alone until a manual retry.
+ *  - "complete": no paywall signal and no extra content, so the article was
+ *    already complete. Never retried.
+ * Shape: { [url]: { reason, attempts, lastAttemptAt, nextAttemptAt, title } }
+ * nextAttemptAt === null means terminal (no automatic retry).
+ * Everything is visible and reversible from the options page.
+ */
+async function getBlockedUrls() {
+  const { blockedUrls } = await browser.storage.local.get("blockedUrls");
+  return blockedUrls || {};
+}
+
+async function getBlockedEntry(url) {
+  const blocked = await getBlockedUrls();
+  return blocked[url] || null;
+}
+
+async function recordBlocked(url, reason, title, aliasOf) {
+  const blocked = await getBlockedUrls();
+  const previous = blocked[url] || { attempts: 0 };
+  const attempts = previous.attempts + 1;
+  let nextAttemptAt = null;
+  if (reason === "paywall" && attempts <= PAYWALL_BACKOFF_MS.length) {
+    nextAttemptAt = Date.now() + PAYWALL_BACKOFF_MS[attempts - 1];
+  }
+  blocked[url] = {
+    reason,
+    attempts,
+    lastAttemptAt: Date.now(),
+    nextAttemptAt,
+    title: title || previous.title || "",
+    // Canonical URL of an article already recorded under its source URL:
+    // kept so the poll can skip it, hidden in the UI to avoid duplicates.
+    aliasOf: aliasOf || null,
+  };
+  await browser.storage.local.set({ blockedUrls: blocked });
+}
+
+/**
+ * One-time cleanup for records written before canonical aliases existed: two
+ * entries sharing the same title and host are the same article, so the extra
+ * one becomes a hidden alias. Idempotent (guarded by a storage flag).
+ */
+async function migrateBlockedAliases() {
+  const { blockedMigrated } = await browser.storage.local.get("blockedMigrated");
+  if (blockedMigrated) return;
+  const blocked = await getBlockedUrls();
+  const seen = new Map();
+  let changed = false;
+  for (const [url, entry] of Object.entries(blocked)) {
+    if (entry.aliasOf) continue;
+    let host = url;
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      // keep the raw URL as key
+    }
+    const key = `${entry.title || ""}|${host}`;
+    if (seen.has(key)) {
+      entry.aliasOf = seen.get(key);
+      changed = true;
+    } else {
+      seen.set(key, url);
+    }
+  }
+  if (changed) await browser.storage.local.set({ blockedUrls: blocked });
+  await browser.storage.local.set({ blockedMigrated: true });
+}
+
+async function clearBlocked(url) {
+  const blocked = await getBlockedUrls();
+  if (blocked[url]) {
+    delete blocked[url];
+    await browser.storage.local.set({ blockedUrls: blocked });
+  }
+}
+
+/**
+ * Effective "thin article" threshold: the popup setting when valid, the
+ * compiled-in default otherwise. Clamped so a bad value cannot disable the
+ * guard or make every document a candidate.
+ */
+async function getLowWordCount() {
+  const { lowWordCount } = await browser.storage.local.get("lowWordCount");
+  // Number(null) and Number("") are 0, not NaN: check emptiness explicitly so
+  // an unset value falls back to the default instead of the lower bound.
+  if (lowWordCount === undefined || lowWordCount === null || lowWordCount === "") {
+    return DEFAULT_LOW_WORD_COUNT;
+  }
+  const n = Math.round(Number(lowWordCount));
+  if (!Number.isFinite(n)) return DEFAULT_LOW_WORD_COUNT;
+  return Math.min(Math.max(n, MIN_LOW_WORD_COUNT), MAX_LOW_WORD_COUNT);
+}
+
 // ============================================================================
 // Polling logic
 // ============================================================================
@@ -208,6 +333,7 @@ async function pollAndEnrich() {
     // leaving the 24h window with only brand-new saves). location=later
     // covers the whole queue; the 24h per-URL cooldown prevents
     // re-processing.
+    const lowWordCount = await getLowWordCount();
     const docs = await listDocuments(token, {
       location: "later",
       maxPages: MAX_LIST_PAGES,
@@ -226,6 +352,19 @@ async function pollAndEnrich() {
       if (await isRecentlyProcessed(doc.source_url)) {
         skipped++;
         continue;
+      }
+
+      // Respect the recorded outcome: a paywall waiting for its next attempt,
+      // and an article known to be complete, are both skipped until due.
+      const blocked = await getBlockedEntry(doc.source_url);
+      if (blocked) {
+        const due =
+          Boolean(blocked.nextAttemptAt) &&
+          blocked.nextAttemptAt <= Date.now();
+        if (!due) {
+          skipped++;
+          continue;
+        }
       }
 
       // Skip documents already enriched by this extension — re-enriching
@@ -259,7 +398,7 @@ async function pollAndEnrich() {
       }
 
       // Determine if this document needs enrichment
-      const needsEnrichment = shouldEnrich(doc);
+      const needsEnrichment = shouldEnrich(doc, lowWordCount);
       if (!needsEnrichment) continue;
 
       console.log(
@@ -267,7 +406,7 @@ async function pollAndEnrich() {
       );
 
       try {
-        const result = await enrichDocument(token, doc);
+        const result = await enrichDocument(token, doc, lowWordCount);
         // Mark the original source URL as processed
         await markProcessed(doc.source_url);
         // Also mark the canonical URL if the fetch followed redirects
@@ -312,12 +451,12 @@ async function pollAndEnrich() {
  * Returns a reason string if yes, or false if no.
  *
  * Logic:
- * - Very low word count (< LOW_WORD_COUNT): always enrich
+ * - Very low word count (< lowWordCount): always enrich
  * - Low-to-medium word count (LOW–HIGH): check HTML for paywall markers
  * - High word count (>= HIGH_WORD_COUNT): skip (assumed complete)
  */
-function shouldEnrich(doc) {
-  if (doc.word_count < LOW_WORD_COUNT) {
+function shouldEnrich(doc, lowWordCount = DEFAULT_LOW_WORD_COUNT) {
+  if (doc.word_count < lowWordCount) {
     return "low-word-count";
   }
 
@@ -345,6 +484,84 @@ function hasPaywallMarkers(html) {
 }
 
 /**
+ * Phrases printed only where an article is cut for non-subscribers. Generic
+ * banners such as "réservé aux abonnés" are excluded on purpose: they also
+ * appear on fully served pages (calibrated on 50 documents, wp48/b03 — D15).
+ */
+const TRUNCATION_MARKERS = [
+  "de cet article à lire",
+  "pour lire la suite",
+  "abonnez-vous pour lire",
+  "cet article est réservé",
+  "la suite est réservée",
+];
+
+/**
+ * Structural paywall containers. Some sites ship them hidden for subscribers,
+ * so a hit is a hint, not a proof: the decision to retry rests on the absence
+ * of extra content, this only names the reason.
+ */
+const PAYWALL_CONTAINER_RE =
+  /(?:class|id)\s*=\s*["'][^"']*(?:paywall|regwall|subscriber-only|premium-content|content-gate|article-gate)[^"']*["']/i;
+
+/**
+ * Detect whether an extracted page is still gated.
+ * Deliberately biased towards "paywall": a false positive costs three spaced
+ * retries, a false negative makes the article silently give up.
+ * @returns {{ paywall: boolean, signals: string[] }}
+ */
+function detectPaywall(html) {
+  const signals = [];
+  const lower = html.toLowerCase();
+
+  if (/"isaccessibleforfree"\s*:\s*false/i.test(html)) {
+    signals.push("json-ld");
+  }
+  if (/article:content_tier[^>]*content=["'](locked|premium)["']/i.test(html)) {
+    signals.push("content_tier");
+  }
+  if (PAYWALL_CONTAINER_RE.test(html)) {
+    signals.push("container");
+  }
+  const truncation = TRUNCATION_MARKERS.find((m) => lower.includes(m));
+  if (truncation) {
+    signals.push("truncation");
+  }
+
+  return { paywall: signals.length > 0, signals };
+}
+
+/**
+ * Rough word count of an HTML fragment (scripts, styles and tags stripped).
+ * Used by the anti-loop guard to compare the extracted page with the word
+ * count Readwise already reports. Deliberately approximate.
+ */
+function estimateWordCount(html) {
+  if (!html) return 0;
+  const text = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&[a-z#0-9]+;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text ? text.split(" ").length : 0;
+}
+
+/**
+ * Word count restricted to <p> elements, falling back to the whole HTML when
+ * a page has too little paragraph markup. Article bodies live in <p>;
+ * navigation and footers do not, so this resists noise far better than a raw
+ * tag-stripped count.
+ */
+function estimateArticleWordCount(html) {
+  if (!html) return 0;
+  const paragraphs = html.match(/<p\b[^>]*>[\s\S]*?<\/p>/gi) || [];
+  const paragraphWords = estimateWordCount(paragraphs.join(" "));
+  return paragraphWords >= 80 ? paragraphWords : estimateWordCount(html);
+}
+
+/**
  * Enrich a single document by loading it in a background tab,
  * extracting the full page HTML, and pushing it to Readwise.
  *
@@ -353,13 +570,17 @@ function hasPaywallMarkers(html) {
  *   canonicalUrl: the URL used for the replacement (after redirects),
  *     so the caller can mark it as processed to prevent re-enrichment
  */
-async function enrichDocument(token, doc) {
+async function enrichDocument(token, doc, lowWordCount = DEFAULT_LOW_WORD_COUNT) {
   const result = await extractPageHtml(doc.source_url);
 
   if (!result?.html) {
     console.warn(
       `[readwise-full-content] No HTML extracted from ${doc.source_url}`,
     );
+    // Nothing extracted at all: usually a JS challenge or a blocked fetch.
+    // Recorded as "paywall" (retriable) rather than "complete" (terminal):
+    // the article may well be recoverable once the page serves normally.
+    await recordBlocked(doc.source_url, "paywall", doc.title);
     return { enriched: false };
   }
 
@@ -371,6 +592,9 @@ async function enrichDocument(token, doc) {
     console.warn(
       `[readwise-full-content] Unusable HTML (${html.length} bytes), skipping — ${doc.source_url}`,
     );
+    // Challenge page or stub too small to be the article: same reasoning as
+    // above, retriable rather than terminal.
+    await recordBlocked(doc.source_url, "paywall", doc.title);
     return { enriched: false };
   }
 
@@ -378,21 +602,34 @@ async function enrichDocument(token, doc) {
   // This handles tracking redirects like click.e.economist.com → economist.com
   const canonicalUrl = finalUrl || doc.source_url;
 
-  // Post-extraction check: only *truncation* notices block the save — wording
-  // that appears in a truncated page and disappears when the full article is
-  // served to a logged-in subscriber. Site-wide banners and footers (e.g.
-  // "Réservé aux abonnés" on lemonde.fr, promo blocks on telerama.fr) are
-  // present on fully served pages too, so PAYWALL_MARKERS must NOT be used
-  // here: they would reject every legitimate enrichment (observed in
-  // production 2026-09-08). Residual risk of saving a truncated page (expired
-  // cookies) is bounded by MIN_HTML_SIZE + the 24h cooldown.
-  const TRUNCATION_MARKERS = ["de cet article à lire"];
-  const extractedLower = html.toLowerCase();
-  if (TRUNCATION_MARKERS.some((m) => extractedLower.includes(m.toLowerCase()))) {
+  // Decide from the extraction outcome, never from a word-count heuristic.
+  // Two outcomes are failures, and only the reason differs:
+  //  - still gated after extraction ("paywall") → retried with a backoff;
+  //  - no extra content and no gate ("complete") → the article was already
+  //    complete, retrying would never bring anything.
+  const extractedWords = estimateArticleWordCount(html);
+  const reportedWords = Number(doc.word_count) || 0;
+  const gained = extractedWords >= reportedWords * MIN_GAIN_RATIO;
+
+  if (!gained) {
+    const verdict = detectPaywall(html);
+    const reason = verdict.paywall ? "paywall" : "complete";
     console.warn(
-      `[readwise-full-content] Extracted HTML still truncated, skipping — ${doc.source_url}`,
+      `[readwise-full-content] No gain (${extractedWords} extracted vs ${reportedWords} reported words) — ${reason}` +
+        (verdict.signals.length ? ` [${verdict.signals.join(", ")}]` : "") +
+        ` — ${doc.source_url}`,
     );
-    return { enriched: false, canonicalUrl };
+    await recordBlocked(doc.source_url, reason, doc.title);
+    if (canonicalUrl !== doc.source_url) {
+      await recordBlocked(canonicalUrl, reason, doc.title, doc.source_url);
+    }
+    return { enriched: false };
+  }
+
+  // Richer than what Readwise had: drop any stale record for these URLs.
+  await clearBlocked(doc.source_url);
+  if (canonicalUrl !== doc.source_url) {
+    await clearBlocked(canonicalUrl);
   }
 
   // Preserve tags: the replacement document is created fresh and would
@@ -750,6 +987,8 @@ browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   const token = await getToken();
   if (!token) return;
+
+  await migrateBlockedAliases();
 
   const { pollingEnabled } = await browser.storage.local.get("pollingEnabled");
   if (pollingEnabled !== false) {

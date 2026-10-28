@@ -3,3 +3,6 @@ web-ext-artifacts/
 *.xpi
 *.har
 .DS_Store
+
+# web-ext signing artefact
+.amo-upload-uuid

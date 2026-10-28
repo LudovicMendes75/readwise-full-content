@@ -144,7 +144,8 @@
       }
 
       input[type="password"],
-      input[type="text"] {
+      input[type="text"],
+      input[type="number"] {
         width: 100%;
         padding: 8px 10px;
         border: 1px solid #ccc;
@@ -280,6 +281,41 @@
       </div>
       <button class="secondary" id="retry-all-btn" style="margin-top: 4px">
         Re-check all recent articles
+      </button>
+      <div style="margin-top: 12px">
+        <label for="low-word-input">Thin article threshold (words)</label>
+        <input
+          type="number"
+          id="low-word-input"
+          min="100"
+          max="1500"
+          step="50"
+        />
+        <div class="hint">
+          Articles below this word count are always enriched. Default: 500. No
+          re-signing needed to change it.
+        </div>
+      </div>
+      <div class="toggle-row" style="margin-top: 4px">
+        <div>
+          <div class="label">Paywall not bypassed</div>
+          <div class="sublabel" id="paywall-count">0 article</div>
+        </div>
+      </div>
+      <button class="secondary" id="retry-paywalls-btn" style="margin-top: 4px">
+        Retry paywalls (next cycle)
+      </button>
+      <div class="toggle-row" style="margin-top: 4px">
+        <div>
+          <div class="label">Already complete</div>
+          <div class="sublabel" id="complete-count">0 article</div>
+        </div>
+      </div>
+      <button class="secondary" id="reset-complete-btn" style="margin-top: 4px">
+        Reset complete articles
+      </button>
+      <button class="secondary" id="manage-list-btn" style="margin-top: 8px">
+        Manage list
       </button>
       <div id="tab-extraction-row" class="hidden">
         <div class="toggle-row" style="margin-top: 4px">

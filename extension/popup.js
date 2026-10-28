@@ -29,10 +29,65 @@ const els = {
   tokenInput: document.getElementById("token-input"),
   saveTokenBtn: document.getElementById("save-token-btn"),
   tokenMissing: document.getElementById("token-missing"),
+  lowWordInput: document.getElementById("low-word-input"),
+  paywallCount: document.getElementById("paywall-count"),
+  completeCount: document.getElementById("complete-count"),
+  retryPaywallsBtn: document.getElementById("retry-paywalls-btn"),
+  resetCompleteBtn: document.getElementById("reset-complete-btn"),
+  manageListBtn: document.getElementById("manage-list-btn"),
 };
 
 // Current page state
 let currentTab = null;
+
+// Mirrors DEFAULT_LOW_WORD_COUNT / bounds in background.js. Kept here so the
+// popup can render a value before the background script answers; the
+// background clamps the stored value again on every poll.
+const DEFAULT_LOW_WORD_COUNT = 500;
+const MIN_LOW_WORD_COUNT = 100;
+const MAX_LOW_WORD_COUNT = 1500;
+
+function clampLowWordCount(value) {
+  if (value === undefined || value === null || value === "") {
+    return DEFAULT_LOW_WORD_COUNT;
+  }
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n)) return DEFAULT_LOW_WORD_COUNT;
+  return Math.min(Math.max(n, MIN_LOW_WORD_COUNT), MAX_LOW_WORD_COUNT);
+}
+
+async function refreshBlockedCounts() {
+  const { blockedUrls } = await browser.storage.local.get("blockedUrls");
+  // Aliases (canonical URL of an already recorded article) are hidden from
+  // the counts: one article must not appear twice.
+  const entries = Object.values(blockedUrls || {}).filter((e) => !e.aliasOf);
+  const paywall = entries.filter((e) => e.reason === "paywall").length;
+  const complete = entries.filter((e) => e.reason === "complete").length;
+  els.paywallCount.textContent = `${paywall} article${paywall > 1 ? "s" : ""}`;
+  els.completeCount.textContent = `${complete} article${complete > 1 ? "s" : ""}`;
+}
+
+/**
+ * Forget every recorded outcome for one reason, so the next poll retries
+ * those URLs from scratch.
+ */
+async function forgetBlocked(reason) {
+  const { blockedUrls, processedUrls } = await browser.storage.local.get([
+    "blockedUrls",
+    "processedUrls",
+  ]);
+  const blocked = blockedUrls || {};
+  const processed = processedUrls || {};
+  for (const [url, entry] of Object.entries(blocked)) {
+    if (entry.reason === reason) {
+      delete blocked[url];
+      // Also drop the 24h cooldown, otherwise the next poll skips the URL.
+      delete processed[url];
+    }
+  }
+  await browser.storage.local.set({ blockedUrls: blocked, processedUrls: processed });
+  await refreshBlockedCounts();
+}
 
 // ============================================================================
 // View management
@@ -61,6 +116,11 @@ async function init() {
   // Load polling state
   const { pollingEnabled } = await browser.storage.local.get("pollingEnabled");
   els.pollingToggle.checked = pollingEnabled !== false;
+
+  // Load enrichment threshold + permanently skipped counter
+  const { lowWordCount } = await browser.storage.local.get("lowWordCount");
+  els.lowWordInput.value = clampLowWordCount(lowWordCount);
+  await refreshBlockedCounts();
 
   // On Android, show the tab extraction toggle
   try {
@@ -110,7 +170,10 @@ function updatePollerStatus(status) {
     return;
   }
   if (status.pollerActive) {
-    els.pollerStatus.textContent = `Active — ${status.processedCount} articles enriched this session.`;
+    // processedCount is the number of URLs handled in the last 24 hours
+    // (the cooldown window), not the number enriched during this session.
+    const n = status.processedCount;
+    els.pollerStatus.textContent = `Active — ${n} article${n === 1 ? "" : "s"} processed in the last 24 hours.`;
   } else {
     els.pollerStatus.textContent = "Paused.";
   }
@@ -244,6 +307,25 @@ els.retryAllBtn.addEventListener("click", async () => {
     els.retryAllBtn.disabled = false;
     els.retryAllBtn.textContent = "Re-check all recent articles";
   }, 3000);
+});
+
+els.lowWordInput.addEventListener("change", async () => {
+  const value = clampLowWordCount(els.lowWordInput.value);
+  els.lowWordInput.value = value;
+  await browser.storage.local.set({ lowWordCount: value });
+});
+
+els.retryPaywallsBtn.addEventListener("click", async () => {
+  await forgetBlocked("paywall");
+});
+
+els.resetCompleteBtn.addEventListener("click", async () => {
+  await forgetBlocked("complete");
+});
+
+els.manageListBtn.addEventListener("click", () => {
+  // Dedicated tab rather than the cramped embed inside about:addons.
+  browser.tabs.create({ url: browser.runtime.getURL("options.html") });
 });
 
 els.tabExtractionToggle.addEventListener("change", async () => {
