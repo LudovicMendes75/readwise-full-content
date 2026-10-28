@@ -64,6 +64,25 @@
         width: 100%;
         border-collapse: collapse;
         margin-bottom: 20px;
+        /* Fixed layout: without it the first column grows to fit a long URL
+           and pushes the other columns off screen. */
+        table-layout: fixed;
+      }
+
+      th:nth-child(1) {
+        width: 52%;
+      }
+      th:nth-child(2) {
+        width: 11%;
+      }
+      th:nth-child(3) {
+        width: 8%;
+      }
+      th:nth-child(4) {
+        width: 21%;
+      }
+      th:nth-child(5) {
+        width: 8%;
       }
 
       th {
@@ -85,6 +104,13 @@
       .title {
         font-weight: 600;
         line-height: 1.35;
+        /* Two lines maximum, then an ellipsis. Long URLs become the title
+           when the document has none, so this is the common case. */
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        overflow-wrap: anywhere;
       }
 
       a.title {
@@ -100,7 +126,9 @@
       .host {
         font-size: 11px;
         color: var(--grey);
-        word-break: break-all;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
 
       .badge {
@@ -120,6 +148,16 @@
       .badge.complete {
         background: var(--light);
         color: var(--grey);
+      }
+
+      .badge.enriched {
+        background: #d4edda;
+        color: #155724;
+      }
+
+      .badge.manual {
+        background: #fff3cd;
+        color: #856404;
       }
 
       .muted {
@@ -149,6 +187,10 @@
       td button {
         padding: 5px 10px;
         font-size: 12px;
+      }
+
+      td button + button {
+        margin-left: 6px;
       }
 
       .toolbar {
@@ -200,20 +242,65 @@
         gap: 10px;
         flex-wrap: wrap;
       }
+
+      .panel {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 16px;
+        margin-bottom: 24px;
+      }
+
+      .panel h2 {
+        font-size: 14px;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+
+      .panel .intro {
+        margin-bottom: 12px;
+      }
+
+      progress {
+        display: block;
+        width: 100%;
+        height: 8px;
+        margin: 12px 0 6px;
+        accent-color: var(--accent);
+      }
     </style>
   </head>
   <body>
-    <h1>Blocked articles</h1>
+    <h1>Enrichment log</h1>
     <p class="intro">
-      Articles the extension could not enrich. <b>Paywall</b> entries are
-      retried after 1 day, 7 days and 30 days, then left alone until you retry
-      them here. <b>Complete</b> entries need no retry: the page brings nothing
-      more than what Readwise already has. Nothing here depends on the article
-      length.
+      What the extension did with the articles it looked at. <b>Enriched</b>
+      entries got their full content. <b>Paywall</b> entries are retried after
+      1 day, 7 days and 30 days, then left alone until you retry them here.
+      <b>Complete</b> entries need no retry: the page brings nothing more than
+      what Readwise already has. Nothing here depends on the article length.
     </p>
 
     <div id="empty" class="empty">
       Nothing blocked — every article has been enriched.
+    </div>
+
+    <div class="panel">
+      <h2>Archive backfill</h2>
+      <p class="intro">
+        Repairs archived documents imported without their text (Pocket
+        migration, bare RSS items, Android shares). Each one is deleted and
+        re-created with the page content, fetched with your browser session.
+        Runs once, at your request: expect 20 to 45 minutes, a few tabs
+        opening, and some failures on dead links or paywalls you do not
+        subscribe to.
+      </p>
+      <div class="actions">
+        <button class="primary" id="start-backfill">
+          Backfill archived articles
+        </button>
+        <button id="cancel-backfill" hidden>Stop</button>
+      </div>
+      <progress id="backfill-progress" value="0" max="1" hidden></progress>
+      <div id="backfill-status" class="muted"></div>
     </div>
 
     <div id="toolbar" class="toolbar" hidden>
@@ -223,9 +310,11 @@
         placeholder="Filter by article or site…"
       />
       <select id="filter-reason">
-        <option value="all">All reasons</option>
+        <option value="all">All statuses</option>
+        <option value="enriched">Enriched</option>
         <option value="paywall">Paywall</option>
         <option value="complete">Complete</option>
+        <option value="manual">Manual</option>
       </select>
       <span id="count" class="muted"></span>
     </div>
@@ -245,7 +334,9 @@
 
     <div class="actions">
       <button class="primary" id="retry-paywalls">Retry all paywalls</button>
+      <button id="forget-manual">Forget manual articles</button>
       <button id="forget-complete">Forget complete articles</button>
+      <button id="cleanup-wrappers">Clean up empty wrappers</button>
     </div>
 
     <script src="options.js"></script>

@@ -1,14 +1,17 @@
 /**
- * Options page — lists the articles the extension could not enrich, with the
- * reason and the retry schedule.
+ * Options page — lists what the extension did with the documents it looked at.
  *
- * Filtering (text on article/site, reason) and sorting (article, reason,
- * attempts, next attempt) are client-side only: the whole record is small and
- * lives in storage.local.
+ * Two sources are merged into one table:
+ *  - blocked articles (`blockedUrls`), with the reason and the retry schedule;
+ *  - successful enrichments (`enrichedUrls`), so a backfill can be judged on
+ *    results, not only on failures.
  *
- * Each row can be retried individually: the record is dropped, so the next
- * poll (at most 2 minutes) tries the article again from scratch. The two
- * global buttons do the same by reason.
+ * Filtering (text on article/site, status) and sorting (article, status,
+ * attempts, next attempt) are client-side only: the record is small and lives
+ * in storage.local.
+ *
+ * Blocked rows can be retried: the record is dropped and the 24h cooldown is
+ * cleared, so the next poll (at most 2 minutes) tries the article again.
  */
 
 const els = {
@@ -20,19 +23,25 @@ const els = {
   filterReason: document.getElementById("filter-reason"),
   count: document.getElementById("count"),
   retryPaywalls: document.getElementById("retry-paywalls"),
+  forgetManual: document.getElementById("forget-manual"),
   forgetComplete: document.getElementById("forget-complete"),
+  cleanupWrappers: document.getElementById("cleanup-wrappers"),
+  startBackfill: document.getElementById("start-backfill"),
+  cancelBackfill: document.getElementById("cancel-backfill"),
+  backfillProgress: document.getElementById("backfill-progress"),
+  backfillStatus: document.getElementById("backfill-status"),
 };
 
 const SORT_LABELS = {
   title: "Article",
-  reason: "Reason",
+  status: "Status",
   attempts: "Attempts",
   nextAttemptAt: "Next attempt",
 };
 
 const state = {
   query: "",
-  reason: "all",
+  status: "all",
   sortKey: "nextAttemptAt",
   sortDir: "asc",
 };
@@ -40,6 +49,11 @@ const state = {
 async function getBlocked() {
   const { blockedUrls } = await browser.storage.local.get("blockedUrls");
   return blockedUrls || {};
+}
+
+async function getEnriched() {
+  const { enrichedUrls } = await browser.storage.local.get("enrichedUrls");
+  return Array.isArray(enrichedUrls) ? enrichedUrls : [];
 }
 
 async function saveBlocked(blocked) {
@@ -66,45 +80,83 @@ function hostOf(url) {
   }
 }
 
-function formatNext(entry) {
-  if (entry.reason === "complete") return "—";
-  if (!entry.nextAttemptAt) return "no automatic retry";
-  return new Date(entry.nextAttemptAt).toLocaleString();
+function formatDate(timestamp) {
+  return new Date(timestamp).toLocaleString();
 }
 
-/** Canonical aliases (same article under another URL) are never listed. */
-function listableEntries(blocked) {
-  return Object.entries(blocked).filter(([, entry]) => !entry.aliasOf);
+function formatNext(row) {
+  if (row.status === "enriched") return "—";
+  if (row.status === "complete") return "—";
+  if (row.status === "manual") return "—";
+  if (!row.nextAttemptAt) return "no automatic retry";
+  return formatDate(row.nextAttemptAt);
 }
 
-function matchesFilters(url, entry) {
-  if (state.reason !== "all" && entry.reason !== state.reason) return false;
+/**
+ * One row per article. Blocked entries carry their canonical alias (hidden
+ * here, removed together on Retry); enriched entries come from the log.
+ */
+async function loadRows() {
+  const [blocked, enriched] = await Promise.all([getBlocked(), getEnriched()]);
+  const rows = [];
+
+  for (const [url, entry] of Object.entries(blocked)) {
+    if (entry.aliasOf) continue;
+    rows.push({
+      url,
+      title: entry.title || "",
+      status: entry.reason,
+      attempts: entry.attempts || 0,
+      nextAttemptAt: entry.nextAttemptAt || null,
+      at: entry.lastAttemptAt || null,
+      blocked: true,
+    });
+  }
+
+  for (const entry of enriched) {
+    if (blocked[entry.url]) continue; // a later failure supersedes the success
+    rows.push({
+      url: entry.url,
+      title: entry.title || "",
+      status: "enriched",
+      attempts: null,
+      nextAttemptAt: null,
+      at: entry.at || null,
+      blocked: false,
+    });
+  }
+
+  return rows;
+}
+
+function matchesFilters(row) {
+  if (state.status !== "all" && row.status !== state.status) return false;
   const query = state.query.trim().toLowerCase();
   if (!query) return true;
   return (
-    (entry.title || "").toLowerCase().includes(query) ||
-    hostOf(url).toLowerCase().includes(query) ||
-    url.toLowerCase().includes(query)
+    (row.title || "").toLowerCase().includes(query) ||
+    hostOf(row.url).toLowerCase().includes(query) ||
+    row.url.toLowerCase().includes(query)
   );
 }
 
-function sortValue(url, entry, key) {
+function sortValue(row, key) {
   switch (key) {
     case "title":
-      return (entry.title || url).toLowerCase();
-    case "reason":
-      return entry.reason;
+      return (row.title || row.url).toLowerCase();
+    case "status":
+      return row.status;
     case "attempts":
-      return entry.attempts || 0;
+      return row.attempts || 0;
     default:
-      return entry.nextAttemptAt || Number.MAX_SAFE_INTEGER;
+      return row.nextAttemptAt || Number.MAX_SAFE_INTEGER;
   }
 }
 
-function sortEntries(entries) {
-  return entries.sort((a, b) => {
-    const va = sortValue(a[0], a[1], state.sortKey);
-    const vb = sortValue(b[0], b[1], state.sortKey);
+function sortRows(rows) {
+  return rows.sort((a, b) => {
+    const va = sortValue(a, state.sortKey);
+    const vb = sortValue(b, state.sortKey);
     const cmp =
       typeof va === "number" && typeof vb === "number"
         ? va - vb
@@ -125,64 +177,97 @@ function updateSortIndicators() {
   }
 }
 
-function buildRow(url, entry) {
+function statusLabel(status) {
+  if (status === "paywall") return "Paywall";
+  if (status === "complete") return "Complete";
+  if (status === "manual") return "Manual";
+  return "Enriched";
+}
+
+function buildRow(row) {
   const tr = document.createElement("tr");
 
   const titleCell = document.createElement("td");
-  // Clickable title: opens the article itself so the reason can be checked
+  // Clickable title: opens the article itself so the status can be checked
   // by hand (paywall really there? article really complete?).
   const title = document.createElement("a");
   title.className = "title";
-  title.href = url;
+  title.href = row.url;
   title.target = "_blank";
   title.rel = "noreferrer";
-  title.textContent = entry.title || url;
-  const host = document.createElement("div");
-  host.className = "host";
-  host.textContent = hostOf(url);
-  titleCell.append(title, host);
+  title.textContent = row.title || row.url;
+  // Full text on hover: the cell truncates to two lines.
+  title.title = row.title || row.url;
+  const meta = document.createElement("div");
+  meta.className = "host";
+  const parts = [hostOf(row.url)];
+  if (row.status === "enriched" && row.at) parts.push(`enriched ${formatDate(row.at)}`);
+  meta.textContent = parts.join(" · ");
+  titleCell.append(title, meta);
 
-  const reasonCell = document.createElement("td");
+  const statusCell = document.createElement("td");
   const badge = document.createElement("span");
-  badge.className = `badge ${entry.reason}`;
-  badge.textContent = entry.reason === "paywall" ? "Paywall" : "Complete";
-  reasonCell.append(badge);
+  badge.className = `badge ${row.status}`;
+  badge.textContent = statusLabel(row.status);
+  statusCell.append(badge);
 
   const attemptsCell = document.createElement("td");
   attemptsCell.className = "muted";
-  attemptsCell.textContent = String(entry.attempts || 0);
+  attemptsCell.textContent = row.attempts === null ? "—" : String(row.attempts);
 
   const nextCell = document.createElement("td");
   nextCell.className = "muted";
-  nextCell.textContent = formatNext(entry);
+  nextCell.textContent = formatNext(row);
 
   const actionCell = document.createElement("td");
-  const retry = document.createElement("button");
-  retry.textContent = "Retry";
-  retry.addEventListener("click", async () => {
-    const current = await getBlocked();
-    const group = [url];
-    delete current[url];
-    for (const [otherUrl, other] of Object.entries(current)) {
-      if (other.aliasOf === url) {
-        group.push(otherUrl);
-        delete current[otherUrl];
+  if (row.blocked) {
+    // Forget: the article has been handled elsewhere (manually, or given up
+    // on). Drop the record without retrying, so it leaves the list.
+    const forget = document.createElement("button");
+    forget.textContent = "Forget";
+    forget.addEventListener("click", async () => {
+      const current = await getBlocked();
+      const group = [row.url];
+      delete current[row.url];
+      for (const [otherUrl, other] of Object.entries(current)) {
+        if (other.aliasOf === row.url) {
+          group.push(otherUrl);
+          delete current[otherUrl];
+        }
       }
-    }
-    await saveBlocked(current);
-    await clearProcessed(group);
-    await render();
-  });
-  actionCell.append(retry);
+      await saveBlocked(current);
+      await clearProcessed(group);
+      await render();
+    });
+    actionCell.append(forget);
 
-  tr.append(titleCell, reasonCell, attemptsCell, nextCell, actionCell);
+    const retry = document.createElement("button");
+    retry.textContent = "Retry";
+    retry.addEventListener("click", async () => {
+      // Re-runs the enrichment now, in the background: clearing the record
+      // alone did nothing for archived documents, which only the backfill
+      // scans.
+      retry.disabled = true;
+      retry.textContent = "Retrying…";
+      const response = await browser.runtime.sendMessage({
+        type: "RETRY_URL",
+        url: row.url,
+      });
+      await render();
+      if (!response?.ok) {
+        window.alert(`Retry failed: ${response?.error || "unknown error"}`);
+      }
+    });
+    actionCell.append(retry);
+  }
+
+  tr.append(titleCell, statusCell, attemptsCell, nextCell, actionCell);
   return tr;
 }
 
 async function render() {
-  const blocked = await getBlocked();
-  const all = listableEntries(blocked);
-  const visible = sortEntries(all.filter(([url, entry]) => matchesFilters(url, entry)));
+  const all = await loadRows();
+  const visible = sortRows(all.filter(matchesFilters));
 
   els.empty.hidden = all.length > 0;
   els.toolbar.hidden = all.length === 0;
@@ -203,8 +288,8 @@ async function render() {
     els.rows.append(tr);
   }
 
-  for (const [url, entry] of visible) {
-    els.rows.append(buildRow(url, entry));
+  for (const row of visible) {
+    els.rows.append(buildRow(row));
   }
 
   updateSortIndicators();
@@ -222,6 +307,49 @@ async function forgetByReason(reason) {
   await saveBlocked(blocked);
   await clearProcessed(removed);
   await render();
+}
+
+// ---------------------------------------------------------------- backfill
+
+function formatDuration(ms) {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes} min ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+async function refreshBackfill() {
+  const { backfill } = await browser.storage.local.get("backfill");
+
+  els.startBackfill.disabled = Boolean(backfill?.running);
+  els.cancelBackfill.hidden = !backfill?.running;
+
+  if (!backfill || (!backfill.running && !backfill.finishedAt && !backfill.error)) {
+    els.backfillProgress.hidden = true;
+    els.backfillStatus.textContent = "Never run.";
+    return;
+  }
+
+  const total = backfill.total || 0;
+  const processed = backfill.processed || 0;
+  els.backfillProgress.hidden = total === 0;
+  els.backfillProgress.max = Math.max(total, 1);
+  els.backfillProgress.value = processed;
+
+  const counts = `${backfill.enriched || 0} enriched, ${backfill.failed || 0} failed, ${
+    backfill.skipped || 0
+  } skipped`;
+
+  if (backfill.error) {
+    els.backfillStatus.textContent = `Failed: ${backfill.error}`;
+  } else if (backfill.running) {
+    els.backfillStatus.textContent = total
+      ? `Running — ${processed}/${total} · ${counts}`
+      : "Scanning the archive…";
+  } else if (backfill.finishedAt && backfill.startedAt) {
+    const duration = formatDuration(backfill.finishedAt - backfill.startedAt);
+    els.backfillStatus.textContent = `Finished in ${duration} — ${processed}/${total} · ${counts}`;
+  }
 }
 
 // ---------------------------------------------------------------- events
@@ -245,15 +373,55 @@ els.filterText.addEventListener("input", () => {
 });
 
 els.filterReason.addEventListener("change", () => {
-  state.reason = els.filterReason.value;
+  state.status = els.filterReason.value;
   render();
 });
 
 els.retryPaywalls.addEventListener("click", () => forgetByReason("paywall"));
+els.forgetManual.addEventListener("click", () => forgetByReason("manual"));
 els.forgetComplete.addEventListener("click", () => forgetByReason("complete"));
 
+els.cleanupWrappers.addEventListener("click", async () => {
+  const proceed = window.confirm(
+    "Delete archived documents that are empty and only carry a Google/tracker URL, " +
+      "when the real article already exists in the archive. Articles with no other " +
+      "copy are kept. Continue?",
+  );
+  if (!proceed) return;
+  els.cleanupWrappers.disabled = true;
+  els.cleanupWrappers.textContent = "Cleaning…";
+  const result = await browser.runtime.sendMessage({ type: "CLEANUP_WRAPPERS" });
+  els.cleanupWrappers.disabled = false;
+  els.cleanupWrappers.textContent = "Clean up empty wrappers";
+  await render();
+  window.alert(
+    result?.ok
+      ? `Scanned ${result.scanned} · wrappers found ${result.candidates} · ` +
+          `${result.deleted} deleted, ${result.kept} kept (no other copy), ${result.failed} failed.`
+      : `Cleanup failed: ${result?.error || "unknown error"}`,
+  );
+});
+
+els.startBackfill.addEventListener("click", async () => {
+  const proceed = window.confirm(
+    "This will delete and re-create the archived documents that have no content. " +
+      "The operation runs in the background and can take 20 to 45 minutes. Continue?",
+  );
+  if (!proceed) return;
+  await browser.runtime.sendMessage({ type: "START_BACKFILL" });
+  await refreshBackfill();
+});
+
+els.cancelBackfill.addEventListener("click", async () => {
+  await browser.runtime.sendMessage({ type: "CANCEL_BACKFILL" });
+  await refreshBackfill();
+});
+
 browser.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes.blockedUrls) render();
+  if (area !== "local") return;
+  if (changes.blockedUrls || changes.enrichedUrls) render();
+  if (changes.backfill) refreshBackfill();
 });
 
 render();
+refreshBackfill();

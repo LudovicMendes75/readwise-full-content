@@ -37,6 +37,34 @@ const PAYWALL_BACKOFF_MS = [
 ];
 
 /**
+ * A page must yield at least this many words of paragraph text to be worth
+ * saving. Applies to documents Readwise reports as empty (word_count 0),
+ * where the relative gain test is meaningless: without a floor, any page
+ * with a menu would be saved as "full content".
+ */
+const MIN_SAVE_WORDS = 80;
+
+/** A document is considered empty below this word count (archive backfill). */
+const BACKFILL_EMPTY_WORDS = 20;
+
+/** Maximum number of successful enrichments kept in the log. */
+const ENRICHED_MAX = 500;
+
+/**
+ * Tags written back into Reader so an unrecoverable article is never silently
+ * lost: one for a paywall that resisted every retry, one for content the
+ * extension cannot process (PDF, tracker with no destination).
+ */
+const TAG_UNREACHABLE = "articles inaccessibles";
+const TAG_MANUAL = "récupération manuelle";
+
+/**
+ * Delay between two archive backfill documents. Each one costs one DELETE and
+ * one POST, and the documented delete limit is 20/min → 4s keeps a margin.
+ */
+const BACKFILL_DELAY_MS = 4000;
+
+/**
  * Documents above this word count are never enriched (assumed complete).
  * Between LOW and HIGH, we check for paywall markers in the HTML.
  */
@@ -197,6 +225,13 @@ async function isRecentlyProcessed(url) {
   return Date.now() - ts < PROCESS_COOLDOWN;
 }
 
+async function clearProcessed(urls) {
+  if (urls.length === 0) return;
+  const processed = await getProcessedUrls();
+  for (const url of urls) delete processed[url];
+  await browser.storage.local.set({ processedUrls: processed });
+}
+
 async function getEnrichCount() {
   const urls = await getProcessedUrls();
   return Object.keys(urls).length;
@@ -223,7 +258,7 @@ async function getBlockedEntry(url) {
   return blocked[url] || null;
 }
 
-async function recordBlocked(url, reason, title, aliasOf) {
+async function recordBlocked(url, reason, title, aliasOf, docId) {
   const blocked = await getBlockedUrls();
   const previous = blocked[url] || { attempts: 0 };
   const attempts = previous.attempts + 1;
@@ -231,7 +266,7 @@ async function recordBlocked(url, reason, title, aliasOf) {
   if (reason === "paywall" && attempts <= PAYWALL_BACKOFF_MS.length) {
     nextAttemptAt = Date.now() + PAYWALL_BACKOFF_MS[attempts - 1];
   }
-  blocked[url] = {
+  const entry = {
     reason,
     attempts,
     lastAttemptAt: Date.now(),
@@ -240,8 +275,13 @@ async function recordBlocked(url, reason, title, aliasOf) {
     // Canonical URL of an article already recorded under its source URL:
     // kept so the poll can skip it, hidden in the UI to avoid duplicates.
     aliasOf: aliasOf || null,
+    // Kept so the options page can re-run this exact document on demand:
+    // the list API has no filter by URL, only by id.
+    id: docId || previous.id || null,
   };
+  blocked[url] = entry;
   await browser.storage.local.set({ blockedUrls: blocked });
+  return entry;
 }
 
 /**
@@ -273,6 +313,39 @@ async function migrateBlockedAliases() {
   }
   if (changed) await browser.storage.local.set({ blockedUrls: blocked });
   await browser.storage.local.set({ blockedMigrated: true });
+}
+
+/**
+ * Log of successful enrichments (newest first, capped). The blocked list alone
+ * only shows failures, which biases any judgement on a backfill: without the
+ * successes you cannot tell "nothing worked" from "everything worked".
+ * Shape: [{ url, title, words, at }]
+ */
+async function getEnrichedUrls() {
+  const { enrichedUrls } = await browser.storage.local.get("enrichedUrls");
+  return Array.isArray(enrichedUrls) ? enrichedUrls : [];
+}
+
+async function recordEnriched(url, title, words) {
+  const list = await getEnrichedUrls();
+  const entry = { url, title: title || "", words: words || 0, at: Date.now() };
+  const next = [entry, ...list.filter((item) => item.url !== url)].slice(
+    0,
+    ENRICHED_MAX,
+  );
+  await browser.storage.local.set({ enrichedUrls: next });
+}
+
+/**
+ * Backfill the Readwise id on a blocked entry recorded by an older version,
+ * so its row can be retried without a full archive scan.
+ */
+async function rememberBlockedId(url, id) {
+  const blocked = await getBlockedUrls();
+  if (blocked[url] && !blocked[url].id && id) {
+    blocked[url].id = id;
+    await browser.storage.local.set({ blockedUrls: blocked });
+  }
 }
 
 async function clearBlocked(url) {
@@ -319,6 +392,13 @@ async function pollAndEnrich() {
   try {
     const token = await getToken();
     if (!token) return;
+
+    // A running backfill already holds the quota and the documents.
+    const backfill = await getBackfillState();
+    if (backfill.running) {
+      console.log("[readwise-full-content] Backfill in progress, skipping poll");
+      return;
+    }
 
     const { pollingEnabled } = await browser.storage.local.get("pollingEnabled");
     if (pollingEnabled === false) return;
@@ -562,6 +642,137 @@ function estimateArticleWordCount(html) {
 }
 
 /**
+ * Minimal HTML entity decoding for titles (the save API rejects nothing here,
+ * but a title with entities reads badly in Reader).
+ */
+function decodeEntities(text) {
+  return text
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0?39;/gi, "'")
+    .replace(/&nbsp;/gi, " ");
+}
+
+/**
+ * Never send a blank title: the Readwise save API answers 400
+ * {"title": ["This field may not be blank."]}, and replaceDocument has
+ * already deleted the original at that point. Falls back to og:title,
+ * <title>, <h1>, then the URL itself.
+ */
+function titleFromHtml(html, url) {
+  const candidates = [];
+  const og =
+    html.match(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']+)["']/i) ||
+    html.match(/<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:title["']/i);
+  if (og) candidates.push(og[1]);
+  const tag = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (tag) candidates.push(tag[1]);
+  const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  if (h1) candidates.push(h1[1].replace(/<[^>]+>/g, " "));
+
+  for (const raw of candidates) {
+    const title = decodeEntities(raw).replace(/\s+/g, " ").trim().slice(0, 300);
+    if (title) return title;
+  }
+
+  try {
+    const parsed = new URL(url);
+    const last = parsed.pathname.split("/").filter(Boolean).pop();
+    if (last) {
+      const cleaned = decodeURIComponent(last)
+        .replace(/[-_]+/g, " ")
+        .replace(/\.[a-z0-9]+$/i, "")
+        .trim();
+      if (cleaned) return cleaned;
+    }
+    // Root URL: keep the hostname as-is (stripping the TLD would mangle it).
+    return parsed.hostname;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Does the extracted page bring something worth saving?
+ * Two conditions: a real gain over what Readwise already has (20%), and a
+ * floor of MIN_SAVE_WORDS so an empty document is never "enriched" with a
+ * page that contains only navigation.
+ */
+function contentGained(extractedWords, reportedWordCount) {
+  const reported = Number(reportedWordCount) || 0;
+  return extractedWords >= Math.max(MIN_SAVE_WORDS, reported * MIN_GAIN_RATIO);
+}
+
+/**
+ * Google Alerts and newsletter click trackers wrap the real article. Decode
+ * them before fetching, otherwise the extraction lands on a redirect or
+ * consent page and the article is wrongly declared unrecoverable.
+ */
+function resolveTargetUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname;
+    if (host === "google.com" || host.endsWith(".google.com") || host.endsWith(".google.fr")) {
+      const target = parsed.searchParams.get("url") || parsed.searchParams.get("q");
+      if (target && /^https?:/i.test(target)) return target;
+    }
+    // Trackers (Mailjet, Brevo, Sendinblue, Anses…) carry the destination as a
+    // base64 run starting with "aHR0c" (= "http"), in a path segment or in a
+    // query parameter depending on the provider.
+    const base64Run = url.match(/aHR0c[A-Za-z0-9_-]+/);
+    if (base64Run) {
+      try {
+        const raw = base64Run[0].replace(/-/g, "+").replace(/_/g, "/");
+        const padded = raw + "=".repeat((4 - (raw.length % 4)) % 4);
+        const binary = atob(padded);
+        const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+        const decoded = new TextDecoder().decode(bytes);
+        if (/^https?:/i.test(decoded)) return decoded;
+      } catch {
+        // not base64 after all: keep the original URL
+      }
+    }
+    return url;
+  } catch {
+    return url;
+  }
+}
+
+/** Tag names of a document, from either API shape (array or map). */
+function tagNamesOf(doc) {
+  if (Array.isArray(doc.tags)) {
+    return doc.tags
+      .map((tag) => (typeof tag === "string" ? tag : tag && tag.name))
+      .filter(Boolean);
+  }
+  if (doc.tags && typeof doc.tags === "object") {
+    return Object.keys(doc.tags);
+  }
+  return [];
+}
+
+/** Add a tag to the existing document (never removes the others). */
+async function tagDocument(token, doc, tagName) {
+  try {
+    const existing = tagNamesOf(doc);
+    if (existing.includes(tagName)) return;
+    await updateDocumentTags(token, doc.id, [...existing, tagName]);
+  } catch (err) {
+    console.warn(
+      `[readwise-full-content] Could not tag ${doc.id} "${tagName}": ${err.message}`,
+    );
+  }
+}
+
+/** Flag a document the extension cannot process, and stop retrying it. */
+async function markManual(doc, token) {
+  await tagDocument(token, doc, TAG_MANUAL);
+  await recordBlocked(doc.source_url, "manual", doc.title, null, doc.id);
+}
+
+/**
  * Enrich a single document by loading it in a background tab,
  * extracting the full page HTML, and pushing it to Readwise.
  *
@@ -571,7 +782,16 @@ function estimateArticleWordCount(html) {
  *     so the caller can mark it as processed to prevent re-enrichment
  */
 async function enrichDocument(token, doc, lowWordCount = DEFAULT_LOW_WORD_COUNT) {
-  const result = await extractPageHtml(doc.source_url);
+  const targetUrl = resolveTargetUrl(doc.source_url);
+
+  // The extension cannot read a PDF (no tab access, no text layer): flag it
+  // for manual handling instead of failing silently.
+  if (/\.pdf(?:$|[?#])/i.test(targetUrl)) {
+    await markManual(doc, token);
+    return { enriched: false };
+  }
+
+  const result = await extractPageHtml(targetUrl);
 
   if (!result?.html) {
     console.warn(
@@ -580,8 +800,14 @@ async function enrichDocument(token, doc, lowWordCount = DEFAULT_LOW_WORD_COUNT)
     // Nothing extracted at all: usually a JS challenge or a blocked fetch.
     // Recorded as "paywall" (retriable) rather than "complete" (terminal):
     // the article may well be recoverable once the page serves normally.
-    await recordBlocked(doc.source_url, "paywall", doc.title);
-    return { enriched: false };
+    return failEnrichment(
+      token,
+      doc,
+      targetUrl,
+      null,
+      "paywall",
+      TAG_UNREACHABLE,
+    );
   }
 
   const { html, finalUrl } = result;
@@ -592,15 +818,26 @@ async function enrichDocument(token, doc, lowWordCount = DEFAULT_LOW_WORD_COUNT)
     console.warn(
       `[readwise-full-content] Unusable HTML (${html.length} bytes), skipping — ${doc.source_url}`,
     );
-    // Challenge page or stub too small to be the article: same reasoning as
-    // above, retriable rather than terminal.
-    await recordBlocked(doc.source_url, "paywall", doc.title);
-    return { enriched: false };
+    // Cloudflare challenge: no amount of automatic retrying will pass it, but
+    // the article is readable in the browser. Flag it for the manual
+    // "Save Full Page" flow instead of pretending it is a paywall.
+    if (looksLikeChallenge(html)) {
+      return failEnrichment(token, doc, targetUrl, null, "manual", TAG_MANUAL);
+    }
+    // Stub too small to be the article: retriable rather than terminal.
+    return failEnrichment(
+      token,
+      doc,
+      targetUrl,
+      null,
+      "paywall",
+      TAG_UNREACHABLE,
+    );
   }
 
   // Use the final URL (after redirects) as the canonical URL.
   // This handles tracking redirects like click.e.economist.com → economist.com
-  const canonicalUrl = finalUrl || doc.source_url;
+  const canonicalUrl = finalUrl || targetUrl;
 
   // Decide from the extraction outcome, never from a word-count heuristic.
   // Two outcomes are failures, and only the reason differs:
@@ -609,7 +846,7 @@ async function enrichDocument(token, doc, lowWordCount = DEFAULT_LOW_WORD_COUNT)
   //    complete, retrying would never bring anything.
   const extractedWords = estimateArticleWordCount(html);
   const reportedWords = Number(doc.word_count) || 0;
-  const gained = extractedWords >= reportedWords * MIN_GAIN_RATIO;
+  const gained = contentGained(extractedWords, reportedWords);
 
   if (!gained) {
     const verdict = detectPaywall(html);
@@ -619,11 +856,20 @@ async function enrichDocument(token, doc, lowWordCount = DEFAULT_LOW_WORD_COUNT)
         (verdict.signals.length ? ` [${verdict.signals.join(", ")}]` : "") +
         ` — ${doc.source_url}`,
     );
-    await recordBlocked(doc.source_url, reason, doc.title);
+    const failure = await failEnrichment(
+      token,
+      doc,
+      targetUrl,
+      canonicalUrl,
+      reason,
+      reason === "paywall" ? TAG_UNREACHABLE : null,
+    );
+    if (failure.rebuilt) return failure;
+    // Alias entry for the canonical URL, so the poll skips it too.
     if (canonicalUrl !== doc.source_url) {
-      await recordBlocked(canonicalUrl, reason, doc.title, doc.source_url);
+      await recordBlocked(canonicalUrl, reason, doc.title, doc.source_url, doc.id);
     }
-    return { enriched: false };
+    return failure;
   }
 
   // Richer than what Readwise had: drop any stale record for these URLs.
@@ -637,35 +883,69 @@ async function enrichDocument(token, doc, lowWordCount = DEFAULT_LOW_WORD_COUNT)
   // external triage pipeline). The Readwise save API accepts a "tags" field.
   // list/ returns tags as a {slug: {name, type, created}} MAP, not an array
   // (observed 2026-09-08) — extract names from both shapes.
-  let tagNames = [];
-  if (Array.isArray(doc.tags)) {
-    tagNames = doc.tags.map((t) => (typeof t === "string" ? t : t && t.name));
-  } else if (doc.tags && typeof doc.tags === "object") {
-    tagNames = Object.keys(doc.tags);
-  }
-  const filteredTags = tagNames.filter(Boolean);
+  // A later success means the article was accessible after all: never carry
+  // the "inaccessible" / "manual" flags onto the new document.
+  const filteredTags = tagNamesOf(doc).filter(
+    (tag) => tag !== TAG_UNREACHABLE && tag !== TAG_MANUAL,
+  );
   console.log(
     `[readwise-full-content] Preserving ${filteredTags.length} tags: ${filteredTags.join(", ") || "(none)"}`,
   );
 
-  // Replace the thin document with the full-content version
-  await replaceDocument(token, doc.id, {
+  // Validate the payload BEFORE replaceDocument deletes anything: the save
+  // API rejects a blank title (400) and null characters (400), and by then
+  // the original document is already gone.
+  const safeHtml = html.replace(/\u0000/g, "");
+  const safeTitle = (doc.title || "").trim() || titleFromHtml(safeHtml, canonicalUrl);
+  if (!safeTitle) {
+    console.warn(
+      `[readwise-full-content] No usable title, leaving the document untouched — ${canonicalUrl}`,
+    );
+    await recordBlocked(doc.source_url, "complete", doc.title, null, doc.id);
+    return { enriched: false };
+  }
+
+  // Replace the thin document with the full-content version. replaceDocument
+  // deletes the original first, so any create failure leaves nothing: recover
+  // by saving the validated payload again, and shout if that fails too.
+  const payload = {
     url: canonicalUrl,
-    html,
+    html: safeHtml,
     should_clean_html: true,
-    title: doc.title,
-    author: doc.author,
-    summary: doc.summary,
-    published_date: doc.published_date,
-    image_url: doc.image_url,
+    title: safeTitle,
     tags: filteredTags,
     location: doc.location,
     category: "article",
     saved_using: "readwise-full-content",
-  });
+  };
+  // Readwise rejects an empty string on optional fields with 400
+  // ("This field may not be blank."): omit them instead of sending "".
+  for (const key of ["author", "summary", "published_date", "image_url"]) {
+    const value = doc[key];
+    const hasValue = typeof value === "string" ? value.trim() !== "" : Boolean(value);
+    if (hasValue) payload[key] = value;
+  }
+
+  try {
+    await replaceDocument(token, doc.id, payload);
+  } catch (err) {
+    console.error(
+      `[readwise-full-content] Replace failed AFTER delete — recovering by saving the payload again: ${canonicalUrl} (${err.message})`,
+    );
+    try {
+      await createDocument(token, payload);
+    } catch (retryErr) {
+      console.error(
+        `[readwise-full-content] DATA LOSS: document ${doc.id} deleted and could not be recreated — ${canonicalUrl} (${retryErr.message})`,
+      );
+      throw retryErr;
+    }
+  }
+
+  await recordEnriched(canonicalUrl, safeTitle, extractedWords);
 
   console.log(
-    `[readwise-full-content] ✓ Enriched: "${doc.title}"` +
+    `[readwise-full-content] ✓ Enriched: "${safeTitle}"` +
       (canonicalUrl !== doc.source_url
         ? ` (redirected to ${canonicalUrl})`
         : ""),
@@ -750,19 +1030,21 @@ async function extractViaFetch(url) {
 /**
  * Check if HTML looks like real page content (not a challenge page).
  */
-function isUsableHtml(html) {
-  if (!html || html.length < MIN_HTML_SIZE) return false;
-
-  // Cloudflare challenge markers
-  if (
+function looksLikeChallenge(html) {
+  if (!html) return false;
+  return (
     html.includes("cf-challenge-running") ||
     html.includes("challenge-platform") ||
     html.includes("Just a moment...") ||
     html.includes("Checking your browser")
-  ) {
-    return false;
-  }
+  );
+}
 
+function isUsableHtml(html) {
+  if (!html || html.length < MIN_HTML_SIZE) return false;
+  // Cloudflare challenge pages are big enough to pass the size test, so the
+  // markers are the only thing telling them apart from a real article.
+  if (looksLikeChallenge(html)) return false;
   return true;
 }
 
@@ -875,6 +1157,373 @@ async function stopPoller() {
   console.log("[readwise-full-content] Poller alarm cleared");
 }
 
+/**
+ * The source URL cannot be changed through the API (PATCH accepts title but
+ * ignores url/source_url — verified 2026-10-28). When a document was saved
+ * under a Google Alerts or tracker wrapper, the only way to fix it is to
+ * create it under the real URL, then delete the wrapper.
+ * Create first, delete second: a failure leaves the original intact.
+ */
+async function rebuildUnderResolvedUrl(token, doc, targetUrl) {
+  try {
+    const created = await createDocument(token, {
+      url: targetUrl,
+      location: doc.location || "archive",
+      category: "article",
+      tags: tagNamesOf(doc).filter(
+        (tag) => tag !== TAG_UNREACHABLE && tag !== TAG_MANUAL,
+      ),
+      // Not "readwise-full-content": this document is not enriched yet, it
+      // must stay a candidate (a paywall under the real URL still has to be
+      // retried and tagged later).
+      saved_using: "url-rebuild",
+    });
+    if (!created || !created.id) return false;
+    if (created.id !== doc.id) {
+      await deleteDocument(token, doc.id);
+    }
+    await clearBlocked(doc.source_url);
+    await clearBlocked(targetUrl);
+    console.log(
+      `[readwise-full-content] URL fixed: ${doc.source_url} -> ${targetUrl}`,
+    );
+    return true;
+  } catch (err) {
+    console.warn(
+      `[readwise-full-content] Could not rebuild under ${targetUrl}: ${err.message}`,
+    );
+    return false;
+  }
+}
+
+/**
+ * Every failure path goes through here: if the document was saved under a
+ * wrapper URL, rebuild it under the real one BEFORE recording the failure.
+ * Otherwise the wrapper stays in Reader and the article is never retried
+ * under its real address.
+ */
+async function failEnrichment(token, doc, targetUrl, canonicalUrl, reason, tag) {
+  if (targetUrl && targetUrl !== doc.source_url) {
+    const rebuilt = await rebuildUnderResolvedUrl(
+      token,
+      doc,
+      canonicalUrl || targetUrl,
+    );
+    if (rebuilt) return { enriched: false, rebuilt: true };
+  }
+  await recordBlocked(doc.source_url, reason, doc.title, null, doc.id);
+  if (tag) await tagDocument(token, doc, tag);
+  return { enriched: false };
+}
+
+/**
+ * Normalise a URL for comparison only: drop tracking parameters so a manual
+ * save (which keeps the page's own URL) still matches the wrapper's target.
+ */
+function comparableUrl(url) {
+  try {
+    const parsed = new URL(url);
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (key.toLowerCase().startsWith("utm_")) parsed.searchParams.delete(key);
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Remove the empty wrapper documents left behind by a manual "Save Full Page"
+ * (the manual save lands under the real URL, the old Google/tracker entry
+ * stays empty). A wrapper is deleted only when the real URL exists in the
+ * archive: never remove the last copy of an article.
+ */
+async function cleanupWrapperDocuments() {
+  const token = await getToken();
+  if (!token) return { ok: false, error: "Readwise token not configured" };
+
+  let docs = [];
+  try {
+    docs = await listDocuments(token, {
+      location: "archive",
+      maxPages: 25,
+      pageDelayMs: 5000,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: err.message?.startsWith("RATE_LIMITED")
+        ? "Readwise rate limit reached while scanning the archive. Wait a minute, then retry."
+        : err.message,
+    };
+  }
+
+  const existing = new Set(docs.map((doc) => comparableUrl(doc.source_url || "")));
+  const candidates = docs.filter((doc) => {
+    if (!doc.source_url) return false;
+    if ((Number(doc.word_count) || 0) >= BACKFILL_EMPTY_WORDS) return false;
+    const target = resolveTargetUrl(doc.source_url);
+    return target !== doc.source_url;
+  });
+
+  let deleted = 0;
+  let kept = 0;
+  let failed = 0;
+  for (const doc of candidates) {
+    const target = comparableUrl(resolveTargetUrl(doc.source_url));
+    if (!existing.has(target)) {
+      kept++;
+      continue;
+    }
+    try {
+      await deleteDocument(token, doc.id);
+      await clearBlocked(doc.source_url);
+      deleted++;
+    } catch (err) {
+      failed++;
+      console.warn(
+        `[readwise-full-content] Cleanup failed for ${doc.source_url}: ${err.message}`,
+      );
+      if (err.message?.startsWith("RATE_LIMITED")) {
+        const wait = Math.max(60, Number(err.message.split(":")[1]) || 0);
+        await new Promise((r) => setTimeout(r, wait * 1000));
+      }
+    }
+    await new Promise((r) => setTimeout(r, BACKFILL_DELAY_MS));
+  }
+
+  return { ok: true, scanned: docs.length, candidates: candidates.length, deleted, kept, failed };
+}
+
+/**
+ * Re-run the enrichment for one blocked document, immediately.
+ *
+ * The blocked entry only keeps the URL and the Readwise id: the list API
+ * cannot be filtered by URL, so the document is fetched back by id.
+ * The block and the cooldown are cleared first, because enrichDocument
+ * records whatever happens next (success in the enriched log, failure in the
+ * blocked list).
+ */
+async function retryOneDocument(url) {
+  const token = await getToken();
+  if (!token) return { ok: false, error: "Readwise token not configured" };
+
+  const blocked = await getBlockedUrls();
+  const entry = blocked[url];
+  if (!entry) return { ok: false, error: "Article is not in the blocked list" };
+  if (!entry.id) {
+    return {
+      ok: false,
+      error: "No Readwise id recorded for this article: run the archive backfill instead",
+    };
+  }
+
+  let doc = null;
+  try {
+    const res = await fetch(
+      `${READWISE_BASE}/v3/list/?id=${encodeURIComponent(entry.id)}&withHtmlContent=true`,
+      { headers: { Authorization: `Token ${token}` } },
+    );
+    if (res.status === 429) {
+      return { ok: false, error: "Readwise rate limit, try again in a minute" };
+    }
+    if (res.ok) {
+      const data = await res.json();
+      doc = (data.results || [])[0] || null;
+    }
+  } catch (err) {
+    return { ok: false, error: `Could not reach Readwise (${err.message})` };
+  }
+  if (!doc) {
+    return { ok: false, error: "Document not found in Readwise (deleted?)" };
+  }
+
+  const group = [url];
+  delete blocked[url];
+  for (const [otherUrl, other] of Object.entries(blocked)) {
+    if (other.aliasOf === url) {
+      group.push(otherUrl);
+      delete blocked[otherUrl];
+    }
+  }
+  await browser.storage.local.set({ blockedUrls: blocked });
+  await clearProcessed([...group, doc.source_url, doc.url].filter(Boolean));
+
+  const lowWordCount = await getLowWordCount();
+  try {
+    const result = await enrichDocument(token, doc, lowWordCount);
+    return { ok: true, enriched: Boolean(result.enriched) };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+// ============================================================================
+// Archive backfill — one-shot repair of documents imported without content
+// ============================================================================
+
+/**
+ * Progress record for the archive backfill, readable by the options page.
+ * { running, cancelled, error, total, processed, enriched, skipped, failed,
+ *   startedAt, finishedAt }
+ */
+async function getBackfillState() {
+  const { backfill } = await browser.storage.local.get("backfill");
+  return backfill || { running: false };
+}
+
+async function setBackfillState(patch) {
+  const current = await getBackfillState();
+  await browser.storage.local.set({ backfill: { ...current, ...patch } });
+}
+
+async function bumpBackfill(delta) {
+  const current = await getBackfillState();
+  const next = { ...current };
+  for (const [key, value] of Object.entries(delta)) {
+    next[key] = (next[key] || 0) + value;
+  }
+  await browser.storage.local.set({ backfill: next });
+}
+
+/**
+ * Repair archived documents that were imported with metadata only (Pocket
+ * migration, bare RSS items, Android share sheet): their text never reached
+ * Readwise, so Reader shows them empty and the fiche pipeline can only fall
+ * back to Jina.
+ *
+ * Readwise dedupes on URL and a re-save does not update the content, so each
+ * document is deleted and re-created (replaceDocument) with the page fetched
+ * here, cookies included — the only way to get past a paywall.
+ *
+ * One-shot and explicit: nothing runs unless the options page asks for it.
+ */
+async function runArchiveBackfill() {
+  const current = await getBackfillState();
+  if (current.running) return;
+
+  const token = await getToken();
+  if (!token) {
+    await setBackfillState({ error: "Readwise token not configured" });
+    return;
+  }
+
+  await setBackfillState({
+    running: true,
+    cancelled: false,
+    error: null,
+    total: 0,
+    processed: 0,
+    enriched: 0,
+    skipped: 0,
+    failed: 0,
+    startedAt: Date.now(),
+    finishedAt: null,
+  });
+
+  try {
+    const lowWordCount = await getLowWordCount();
+
+    // The archive is ~1200 documents: 13 pages at 100/page. The list API is
+    // limited to 20 req/min, hence the 3s throttle inside listDocuments.
+    // 13 pages at 5s spacing: ~12 requests/min, clear of the 20/min ceiling.
+    let docs = [];
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        docs = await listDocuments(token, {
+          location: "archive",
+          maxPages: 25,
+          pageDelayMs: 5000,
+        });
+        break;
+      } catch (err) {
+        if (!err.message?.startsWith("RATE_LIMITED") || attempt === 4) throw err;
+        // The quota window is a minute: Retry-After can be a couple of
+        // seconds, which is never enough, so wait a full window.
+        const wait = Math.max(60, Number(err.message.split(":")[1]) || 0);
+        console.warn(
+          `[readwise-full-content] Archive list rate limited, waiting ${wait}s (attempt ${attempt}/4)`,
+        );
+        await new Promise((r) => setTimeout(r, wait * 1000));
+      }
+    }
+
+    const targets = docs.filter((doc) => {
+      const words = Number(doc.word_count) || 0;
+      if (words >= BACKFILL_EMPTY_WORDS) return false;
+      // Already enriched by this extension: re-scraping would loop.
+      if (doc.source === "readwise-full-content") return false;
+      if (!["article", "rss"].includes(doc.category)) return false;
+      if (!doc.source_url) return false;
+      try {
+        const url = new URL(doc.source_url);
+        if (url.hostname.includes("readwise.io")) return false;
+        if (!url.protocol.startsWith("http")) return false;
+      } catch {
+        return false;
+      }
+      return true;
+    });
+
+    await setBackfillState({ total: targets.length });
+
+    for (const doc of targets) {
+      const state = await getBackfillState();
+      if (state.cancelled) break;
+
+      // Respect the paywall backoff: a terminal entry is not retried here.
+      const blocked = await getBlockedEntry(doc.source_url);
+      if (blocked) {
+        const due =
+          Boolean(blocked.nextAttemptAt) &&
+          blocked.nextAttemptAt <= Date.now();
+        if (!due) {
+          // Older entries carry no Readwise id: record it while we have it.
+          await rememberBlockedId(doc.source_url, doc.id);
+          await bumpBackfill({ skipped: 1, processed: 1 });
+          continue;
+        }
+      }
+
+      try {
+        const result = await enrichDocument(token, doc, lowWordCount);
+        if (result.enriched) {
+          await clearBlocked(doc.source_url);
+          if (result.canonicalUrl && result.canonicalUrl !== doc.source_url) {
+            await clearBlocked(result.canonicalUrl);
+          }
+          await bumpBackfill({ enriched: 1, processed: 1 });
+        } else {
+          await bumpBackfill({ failed: 1, processed: 1 });
+        }
+        await markProcessed(doc.source_url);
+      } catch (err) {
+        await bumpBackfill({ failed: 1, processed: 1 });
+        if (err.message?.startsWith("RATE_LIMITED")) {
+          const wait = Number(err.message.split(":")[1]) || 60;
+          console.warn(`[readwise-full-content] Backfill rate limited, waiting ${wait}s`);
+          await new Promise((r) => setTimeout(r, wait * 1000));
+        } else {
+          console.error(
+            `[readwise-full-content] Backfill failed for ${doc.source_url}:`,
+            err.message,
+          );
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, BACKFILL_DELAY_MS));
+    }
+  } catch (err) {
+    console.error("[readwise-full-content] Backfill aborted:", err.message);
+    const friendly = err.message?.startsWith("RATE_LIMITED")
+      ? "Readwise rate limit reached while scanning the archive (20 requests/min). Wait a few minutes, then start again."
+      : err.message;
+    await setBackfillState({ error: friendly });
+  } finally {
+    await setBackfillState({ running: false, finishedAt: Date.now() });
+  }
+}
+
 // ============================================================================
 // Message handler (from popup)
 // ============================================================================
@@ -887,28 +1536,24 @@ browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const token = await getToken();
         if (!token) throw new Error("Readwise token not configured");
 
-        const result = await createDocument(token, {
+        const safeHtml = (message.html || "").replace(/\u0000/g, "");
+        const safeTitle =
+          (message.title || "").trim() || titleFromHtml(safeHtml, message.url);
+        const manualPayload = {
           url: message.url,
-          html: message.html,
+          html: safeHtml,
           should_clean_html: true,
-          title: message.title,
-          author: message.author,
+          title: safeTitle,
           location: "new",
           category: "article",
           saved_using: "readwise-full-content",
-        });
+        };
+        if (message.author) manualPayload.author = message.author;
+
+        const result = await createDocument(token, manualPayload);
 
         if (result.alreadyExisted) {
-          const replaced = await replaceDocument(token, result.id, {
-            url: message.url,
-            html: message.html,
-            should_clean_html: true,
-            title: message.title,
-            author: message.author,
-            location: "new",
-            category: "article",
-            saved_using: "readwise-full-content",
-          });
+          const replaced = await replaceDocument(token, result.id, manualPayload);
           sendResponse({ success: true, ...replaced });
         } else {
           sendResponse({ success: true, ...result });
@@ -948,6 +1593,38 @@ browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       sendResponse({ success: true });
     })();
     return true;
+  }
+
+  // Remove empty wrapper documents (options page)
+  if (message.type === "CLEANUP_WRAPPERS") {
+    (async () => {
+      sendResponse(await cleanupWrapperDocuments());
+    })();
+    return true;
+  }
+
+  // Re-run one blocked article (options page, Retry row)
+  if (message.type === "RETRY_URL") {
+    (async () => {
+      sendResponse(await retryOneDocument(message.url));
+    })();
+    return true;
+  }
+
+  // Start the one-shot archive backfill (options page)
+  if (message.type === "START_BACKFILL") {
+    (async () => {
+      await runArchiveBackfill();
+    })();
+    sendResponse({ started: true });
+  }
+
+  // Ask the running backfill to stop after the current document
+  if (message.type === "CANCEL_BACKFILL") {
+    (async () => {
+      await setBackfillState({ cancelled: true });
+    })();
+    sendResponse({ success: true });
   }
 
   // Toggle polling

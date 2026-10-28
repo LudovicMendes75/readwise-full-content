@@ -41,6 +41,7 @@ async function validateToken(token) {
  * @param {string} [opts.location] - new, later, shortlist, archive, feed
  * @param {number} [opts.limit] - 1-100 (default 100)
  * @param {number} [opts.maxPages] - Max pages to fetch (default 1)
+ * @param {number} [opts.pageDelayMs] - Delay between pages (default 3000)
  * @param {boolean} [opts.withHtmlContent] - Include HTML content
  * @returns {Promise<Array>} List of documents
  */
@@ -85,14 +86,42 @@ async function listDocuments(token, opts = {}) {
     }
     pages++;
 
-    // Throttle between pages: Readwise's list API rate-limits rapid
-    // successive requests from the same token.
+    // Throttle between pages: Readwise's list API allows 20 requests per
+    // minute per token, so 3s is the floor. A long scan (archive) passes a
+    // larger delay to stay clear of the ceiling even with other callers.
     if (nextUrl && pages < maxPages) {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      await new Promise((resolve) =>
+        setTimeout(resolve, opts.pageDelayMs || 3000),
+      );
     }
   }
 
   return allResults;
+}
+
+/**
+ * Replace the tag list of an existing document.
+ * The bulk update endpoint expects the full list: pass the existing tags plus
+ * the new one, never just the new one.
+ */
+async function updateDocumentTags(token, documentId, tagNames) {
+  const res = await fetch(`${READWISE_BASE}/v3/bulk_update/`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Token ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ updates: [{ id: documentId, tags: tagNames }] }),
+  });
+
+  if (res.status === 429) {
+    const retryAfter = res.headers.get("Retry-After") || "60";
+    throw new Error(`RATE_LIMITED:${retryAfter}`);
+  }
+  if (res.status !== 200 && res.status !== 207) {
+    throw new Error(`Readwise bulk_update failed: ${res.status}`);
+  }
+  return true;
 }
 
 /**
